@@ -1,0 +1,7 @@
+dbuser=chkdelivery
+dbpass=secretpassword
+dbhost=127.0.0.1
+dbport=3306
+dbname=mail
+dbtable=delivery
+logfile=/var/log/mail.log
