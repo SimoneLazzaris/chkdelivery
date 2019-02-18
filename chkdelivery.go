@@ -23,6 +23,7 @@ type msgData struct {
 	id string
 	from string
 	to string
+	subject string
 	status string
 	stline string
 }
@@ -35,12 +36,14 @@ var (
 	db *sql.DB
 )
 
-func manyPing(db *sql.DB) bool {
+func manyPing(pdb **sql.DB) bool {
 	var err error
 	err=nil
+	db=*pdb
 	for i:=0; i<5 && err==nil; i++ { err=db.Ping() }
 	if err!=nil {
 		fmt.Printf("Database lost, trying to reconnect...\n")
+		db.Close()
 		db,err=sql.Open("mysql",fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?autocommit=true",cfg["dbuser"],cfg["dbpass"],cfg["dbhost"],cfg["dbport"],cfg["dbname"]))
 		if err!=nil {
 			fmt.Printf("Reconnection error: '%s'\n",err)
@@ -50,6 +53,7 @@ func manyPing(db *sql.DB) bool {
 		fmt.Printf("Reconnected\n")
 		err=db.Ping()
 		if err!=nil { fmt.Printf("Ping after reopening Error: '%s'\n",err) }
+		*pdb=db
 	}
 	var dummy int
 	err=db.QueryRow("SELECT 169").Scan(&dummy)
@@ -70,7 +74,19 @@ func fConnection(parms []string) {
 		xlog.Debug(fmt.Sprintf("new connection: id %s",msgid)) 
 		fmt.Printf("new connection: id %s\n",msgid)
 	}
-	msgMap[msgid]=&msgData{msgid,"","","",""}
+	msgMap[msgid]=&msgData{msgid,"","","","",""}
+}
+
+func fNewMessage(parms []string) {
+	msgid:=parms[4]
+	if xdebug { 
+		xlog.Debug(fmt.Sprintf("new message %s <%s>",msgid,parms[5])) 
+		fmt.Printf(fmt.Sprintf("new message %s <%s>\n",msgid,parms[5])) 
+	}
+	if _,ok:=msgMap[msgid]; !ok {
+		// local message, no smtp connection
+		msgMap[msgid]=&msgData{msgid,"","","","",""}
+	}
 }
 
 func fQueueIn(parms []string) {
@@ -82,7 +98,7 @@ func fQueueIn(parms []string) {
 	}
 	if _,ok:=msgMap[msgid]; !ok {
 		// bounce, not present in msgMap
-		msgMap[msgid]=&msgData{msgid,"<BOUNCE>","","",""}
+		msgMap[msgid]=&msgData{msgid,"<BOUNCE>","","","",""}
 	} else {
 		msgMap[msgid].from=msgfrom
 	}
@@ -113,21 +129,21 @@ func fSmtp(parms []string) {
 	}
 	if _,ok:=msgMap[msgid]; !ok {
 		// not present in msgMap
-		msgMap[msgid]=&msgData{msgid,"<???>","","",""}
+		msgMap[msgid]=&msgData{msgid,"<???>","","","",""}
 	}
 	msgMap[msgid].to=msgto
 	msgMap[msgid].status=msgstatus
 	msgMap[msgid].stline=msgextra
 	
-	if manyPing(db) {
-		_,err:=db.Exec("INSERT INTO "+cfg["dbtable"]+" (qid, tstamp, sender, recipient, status, msg) VALUES (?, NOW(), ?, ?, ?, ?)", 
-			msgid, msgMap[msgid].from, msgMap[msgid].to, msgMap[msgid].status, msgMap[msgid].stline)
+	if manyPing(&db) {
+		_,err:=db.Exec("INSERT INTO "+cfg["dbtable"]+" (qid, tstamp, sender, recipient, status, msg, subject) VALUES (?, NOW(), ?, ?, ?, ?, ?)", 
+			msgid, msgMap[msgid].from, msgMap[msgid].to, msgMap[msgid].status, msgMap[msgid].stline, msgMap[msgid].subject)
 		if err!=nil {
 			xlog.Err(fmt.Sprintf("%s",err))
 			fmt.Printf("ERROR: %s\n",err)
 		} else {
 			if xdebug { 
-				xlog.Debug(fmt.Sprintf("smtpout: inserted")) 
+				xlog.Debug("smtpout: inserted")
 				fmt.Printf("smtpout: inserted\n")
 			}
 		}
@@ -137,7 +153,15 @@ func fSmtp(parms []string) {
 	}
 }
 
-func parseLine(s string) {
+func fRspamd(parms []string) {
+	msgid:=parms[4]
+	subject:=parms[5]
+	if _,ok:=msgMap[msgid]; !ok {
+		xlog.Debug(fmt.Sprintf("Message %s not found",msgid))
+		fmt.Printf("Message %s not found\n",msgid)
+		return
+	}
+	msgMap[msgid].subject=subject
 }
 
 func init() {
@@ -148,9 +172,11 @@ func init() {
 	InitCfg(*cfgfile)
 	rAct=[]regaction{
  		regaction {regexp.MustCompile(`^(... .. \d\d:\d\d:\d\d) (\S+) (postfix/smtpd)\[\d+\]: (\S+): (.*)`),"connection",fConnection}, 
- 		regaction {regexp.MustCompile(`^(... .. \d\d:\d\d:\d\d) (\S+) (postfix/qmgr)\[\d+\]: (\S+): from=<(.*)>, size=(\d+), (.*)`), "queuemanager",fQueueIn}, 
- 		regaction {regexp.MustCompile(`^(... .. \d\d:\d\d:\d\d) (\S+) (postfix/smtp)\[\d+\]: (\S+): to=<(.*)>, .* status=(\S+) (.*)`), "smtpout",fSmtp},
+ 		regaction {regexp.MustCompile(`^(... .. \d\d:\d\d:\d\d) (\S+) (postfix/cleanup)\[\d+\]: (\S+): message-id=<(\S*)>`),"newmessage",fNewMessage}, 
+ 		regaction {regexp.MustCompile(`^(... .. \d\d:\d\d:\d\d) (\S+) (postfix/qmgr)\[\d+\]: (\S+): from=<(\S*)>, size=(\d+), (.*)`), "queuemanager",fQueueIn}, 
+ 		regaction {regexp.MustCompile(`^(... .. \d\d:\d\d:\d\d) (\S+) (postfix/smtp)\[\d+\]: (\S+): to=<(\S*)>, .* status=(\S+) (.*)`), "smtpout",fSmtp},
  		regaction {regexp.MustCompile(`^(... .. \d\d:\d\d:\d\d) (\S+) (postfix/qmgr)\[\d+\]: (\S+): (removed)`), "queuemanager",fQueueOut}, 
+ 		regaction {regexp.MustCompile(`^(... .. \d\d:\d\d:\d\d) (\S+) (rspamd)\[\d+\]: .*, qid: <(\S+)>, .*, subject: "(.*)"`), "rspamd", fRspamd},
 	}
 	msgMap=make(map[string]*msgData)
 	var err error
